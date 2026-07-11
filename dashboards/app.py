@@ -364,7 +364,7 @@ with tab_trends:
             st.plotly_chart(fig_loss, use_container_width=True)
 
         st.markdown("---")
-        st.subheader("Incident Resolution vs. Severity Analysis (Task 4.6)")
+        st.subheader("Incident Resolution vs. Severity Analysis")
         
         if not filtered_threats_df.empty:
             col_s1, col_s2 = st.columns([2, 1])
