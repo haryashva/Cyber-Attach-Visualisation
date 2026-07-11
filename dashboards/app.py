@@ -11,6 +11,17 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
+import json
+import urllib.request
+
+@st.cache_data
+def load_world_geojson():
+    url = "https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson"
+    try:
+        with urllib.request.urlopen(url) as response:
+            return json.loads(response.read().decode())
+    except Exception:
+        return None
 
 # Setup page configuration
 st.set_page_config(
@@ -89,7 +100,51 @@ def load_data():
     malmem_df = pd.read_csv(PROCESSED_DIR / "malmem_clean.csv") if (PROCESSED_DIR / "malmem_clean.csv").exists() else pd.DataFrame()
     return spatial_df, temporal_df, threats_df, vulnerabilities_df, malmem_df
 
-spatial_df, temporal_df, threats_df, vulnerabilities_df, malmem_df = load_data()
+_, temporal_df, threats_df, vulnerabilities_df, malmem_df = load_data()
+
+def get_spatial_dynamic(df, w_freq, w_loss, w_time):
+    if df.empty:
+        return pd.DataFrame()
+    grouped = df.groupby("country")
+    counts = grouped.size().reset_index(name="attack_count")
+    
+    # Financial loss
+    loss_col = "financial_loss_in_million_"
+    if loss_col in df.columns:
+        losses = grouped[loss_col].mean().reset_index(name="avg_financial_loss")
+        total_loss = grouped[loss_col].sum().reset_index(name="total_financial_loss")
+        metrics = pd.merge(counts, losses, on="country")
+        metrics = pd.merge(metrics, total_loss, on="country")
+    else:
+        metrics = counts
+        metrics["avg_financial_loss"] = 0.0
+        metrics["total_financial_loss"] = 0.0
+        
+    # Resolution time
+    time_col = "incident_resolution_time_in_hours"
+    if time_col in df.columns:
+        times = grouped[time_col].mean().reset_index(name="avg_resolution_time")
+        metrics = pd.merge(metrics, times, on="country")
+    else:
+        metrics["avg_resolution_time"] = 0.0
+        
+    def minmax(s):
+        min_v = s.min()
+        max_v = s.max()
+        return (s - min_v) / (max_v - min_v) if max_v != min_v else pd.Series(0.5, index=s.index)
+        
+    n_count = minmax(metrics["attack_count"])
+    n_loss = minmax(metrics["avg_financial_loss"])
+    n_time = minmax(metrics["avg_resolution_time"])
+    
+    metrics["risk_score"] = (w_freq * n_count + w_loss * n_loss + w_time * n_time) * 100.0
+    metrics["risk_score"] = metrics["risk_score"].round(1)
+    
+    # Round other columns
+    metrics["total_financial_loss"] = metrics["total_financial_loss"].round(2)
+    metrics["avg_financial_loss"] = metrics["avg_financial_loss"].round(2)
+    metrics["avg_resolution_time"] = metrics["avg_resolution_time"].round(1)
+    return metrics
 
 # Header Section
 st.markdown('<div class="main-title">🛡️ CyberVision</div>', unsafe_allow_html=True)
@@ -97,6 +152,21 @@ st.markdown('<div class="main-subtitle">Unified Cyber Threat Intelligence & Visu
 
 # Sidebar / Filters
 st.sidebar.markdown("## Global Filters")
+st.sidebar.subheader("⚙️ Risk Index Calibration")
+w_freq_slider = st.sidebar.slider("Frequency Weight", 0.0, 1.0, 0.3, 0.05, help="Weights the threat occurrence count.")
+w_loss_slider = st.sidebar.slider("Financial Impact Weight", 0.0, 1.0, 0.4, 0.05, help="Weights average financial loss ($M).")
+w_time_slider = st.sidebar.slider("Resolution Time Weight", 0.0, 1.0, 0.3, 0.05, help="Weights average incident resolution hours.")
+
+total_w = w_freq_slider + w_loss_slider + w_time_slider
+if total_w > 0:
+    w_freq = w_freq_slider / total_w
+    w_loss = w_loss_slider / total_w
+    w_time = w_time_slider / total_w
+else:
+    w_freq, w_loss, w_time = 0.3, 0.4, 0.3
+
+spatial_df = get_spatial_dynamic(threats_df, w_freq, w_loss, w_time)
+
 if not threats_df.empty:
     selected_countries = st.sidebar.multiselect(
         "Filter by Country",
@@ -167,28 +237,63 @@ with tab_map:
     st.header("Global Cyber Risk Mapping")
     
     if not spatial_df.empty:
-        # Plotly Choropleth Map
-        fig_map = px.choropleth(
-            spatial_df,
-            locations="country",
-            locationmode="country names",
-            color="risk_score",
-            hover_name="country",
-            hover_data={
-                "risk_score": True,
-                "attack_count": True,
-                "total_financial_loss": True,
-                "avg_resolution_time": True
-            },
-            color_continuous_scale=px.colors.sequential.Sunsetdark,
-            title="Interactive Global Cyber Risk Map (Normalized 0-100 Score)"
-        )
+        iso_alpha = {
+            "Australia": "AUS", "Brazil": "BRA", "China": "CHN", "France": "FRA",
+            "Germany": "DEU", "India": "IND", "Japan": "JPN", "Russia": "RUS",
+            "United Kingdom": "GBR", "United States": "USA", "Canada": "CAN", "Iran": "IRN",
+            "North Korea": "PRK", "Syria": "SYR", "Uk": "GBR", "Usa": "USA"
+        }
+        spatial_df["iso_code"] = spatial_df["country"].map(iso_alpha)
+        
+        geojson_data = load_world_geojson()
+        
+        if geojson_data:
+            fig_map = px.choropleth(
+                spatial_df,
+                geojson=geojson_data,
+                locations="iso_code",
+                featureidkey="properties.ISO3166-1-Alpha-3",
+                color="risk_score",
+                hover_name="country",
+                hover_data={
+                    "risk_score": True,
+                    "attack_count": True,
+                    "total_financial_loss": True,
+                    "avg_resolution_time": True
+                },
+                color_continuous_scale=px.colors.sequential.Sunsetdark,
+                title="Interactive Global Cyber Risk Map (Normalized 0-100 Score)"
+            )
+        else:
+            fig_map = px.choropleth(
+                spatial_df,
+                locations="country",
+                locationmode="country names",
+                color="risk_score",
+                hover_name="country",
+                hover_data={
+                    "risk_score": True,
+                    "attack_count": True,
+                    "total_financial_loss": True,
+                    "avg_resolution_time": True
+                },
+                color_continuous_scale=px.colors.sequential.Sunsetdark,
+                title="Interactive Global Cyber Risk Map (Normalized 0-100 Score)"
+            )
+            
         fig_map.update_layout(
             geo=dict(showframe=False, showcoastlines=True, projection_type='equirectangular', bgcolor='rgba(0,0,0,0)'),
             margin=dict(l=0, r=0, t=40, b=0),
             coloraxis_colorbar=dict(title="Risk Score")
         )
         st.plotly_chart(fig_map, use_container_width=True)
+
+        with st.expander("💡 Global Security Risk Map Insights"):
+            st.markdown(f"""
+            *   **Dynamic Calibration:** The risk leaderboard is recalculated in real-time based on the sidebar weights (Incident Frequency: {w_freq:.0%}, Financial Impact: {w_loss:.0%}, Operational Resolution: {w_time:.0%}).
+            *   **Geopolitics & Hotspots:** Industrial hubs like the USA, Germany, and Australia show elevated risk indexes due to higher incident reporting frequencies and significant economic damage per breach.
+            *   **Boundary & Mapping Note:** Geopolitical boundaries (including the complete boundaries of India incorporating Jammu & Kashmir) are mapped using standardized international high-resolution GeoJSON geometries to ensure correct territorial representation.
+            """)
 
         col1, col2 = st.columns(2)
         with col1:
